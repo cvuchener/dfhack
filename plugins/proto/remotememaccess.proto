@@ -1,0 +1,54 @@
+package dfproto.RemoteMemAccess;
+
+option optimize_for = LITE_RUNTIME;
+
+enum Arch {
+    I386 = 0;
+    AMD64 = 1;
+}
+enum OS {
+    LINUX = 0;
+    MACOS = 1;
+    WINDOWS = 2;
+}
+enum ABI {
+    MSVC2010 = 0;
+    MSVC2015 = 1;
+    GNU = 2;
+    GNU_CXX11 = 4;
+}
+
+// RemoteMemAccessInfo: EmptyMessage -> Info
+message Info {
+    // protocol versioning
+	required int32 version_major = 1;
+	required int32 version_minor = 2;
+
+	optional Arch arch = 3;
+	optional OS os = 4;
+	optional ABI abi = 5;
+	optional string checksum = 6;
+}
+
+// RemoteMemAccessReadRaw: ReadRawIn -> ReadOut
+// RemoteMemAccessReadString: ReadStringIn -> ReadOut
+// RemoteMemAccessWriteRaw: WriteIn -> EmptyMessage
+// RemoteMemAccessWriteString: WriteIn -> EmptyMessage
+message ReadRawIn {
+	required uint64 address = 1;
+	required int32 length = 2;
+}
+
+message ReadStringIn {
+	required uint64 address = 1;
+}
+
+message ReadOut {
+	optional bytes data = 2;
+}
+
+message WriteIn {
+	required uint64 address = 1;
+	required bytes data = 2;
+}
+
