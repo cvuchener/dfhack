@@ -4,138 +4,17 @@
 
 #include "remotememaccess.pb.h"
 
+#include <cstring>
+
 extern "C" {
-#include <string.h>
-#include <signal.h>
-#include <setjmp.h>
+#include <unistd.h>
+#include <sys/uio.h>
 }
 
 using namespace DFHack;
 using namespace dfproto::RemoteMemAccess;
 
 DFHACK_PLUGIN("remotememaccess")
-
-struct Copy {
-    const char *in;
-    char *out;
-    std::size_t size;
-    bool operator() () {
-        std::copy_n(in, size, out);
-        return true;
-    }
-};
-
-struct CheckString
-{
-    const void *addr;
-    std::size_t len;
-    bool operator() () {
-        struct Rep {
-            std::size_t length;
-            std::size_t capacity;
-            int refcount;
-        };
-        const Rep *rep = *reinterpret_cast<const Rep * const *>(addr);
-        --rep;
-        if (rep->length > rep->capacity) {
-            return false;
-        }
-        len = rep->length;
-        return true;
-    }
-};
-
-static jmp_buf segv_caught;
-
-static void segv_handler(int signum)
-{
-    longjmp(segv_caught, 1);
-}
-
-template<typename Func>
-bool segv_safe(color_ostream &stream, Func &&f)
-{
-    int error;
-    bool success;
-
-    struct sigaction new_sa, old_sa;
-    memset(&new_sa, 0, sizeof(struct sigaction));
-    new_sa.sa_handler = segv_handler;
-
-    sigset_t sigmask;
-    if (-1 == sigprocmask(SIG_SETMASK, NULL, &sigmask)) {
-        error = errno;
-        stream << "Failed to save signal mask: " << strerror(error) << std::endl;
-        return false;
-    }
-    if (setjmp(segv_caught) == 0) {
-        if (-1 == sigaction(SIGSEGV, &new_sa, &old_sa)) {
-            error = errno;
-            stream << "Failed to change signal hander: " << strerror(error) << std::endl;
-            return false;
-        }
-        success = f();
-    }
-    else { // a segfault happened during the copy
-        // the signal mask is still the one from the signal handler, we need to restore it.
-        if (-1 == sigprocmask(SIG_SETMASK, &sigmask, NULL)) {
-            error = errno;
-            stream << "Failed to restore signal mask: " << strerror(error) << std::endl;
-        }
-        success = false;
-    }
-    if (-1 == sigaction(SIGSEGV, &old_sa, NULL)) {
-        error = errno;
-        stream << "Failed to restore signal handler: " << strerror(error) << std::endl;
-    }
-    return success;
-}
-
-static bool safe_copy(color_ostream &stream, const char *in, std::size_t size, char *out)
-{
-    return segv_safe(stream, Copy { in, out, size });
-}
-
-static bool safe_read_string(color_ostream &stream, const void *addr, std::string &out)
-{
-    CheckString check_string { addr };
-    if (!segv_safe(stream, check_string)) {
-        stream << "Address do not point to a valid string" << std::endl;
-        return false;
-    }
-
-    try {
-        out.resize(check_string.len);
-    }
-    catch (std::exception &e) {
-        stream << "Failed to allocate string buffer: " << e.what() << std::endl;
-        return false;
-    }
-
-    const std::string *str = reinterpret_cast<const std::string *>(addr);
-    return segv_safe(stream, Copy { str->data(), &out[0], check_string.len });
-}
-
-static bool safe_write_string(color_ostream &stream, void *addr, const std::string &data)
-{
-    CheckString check_string { addr };
-    if (!segv_safe(stream, check_string)) {
-        stream << "Address do not point to a valid string" << std::endl;
-        return false;
-    }
-
-    std::string *str = reinterpret_cast<std::string *>(addr);
-    try {
-        // TODO: Require segv_safe block? Is lonjmp from std::string::assign ok?
-        str->assign(data);
-    }
-    catch (std::exception &e) {
-        stream << "Failed to assign string: " << e.what() << std::endl;
-        return false;
-    }
-    return true;
-}
-
 
 DFhackCExport command_result plugin_init(color_ostream &out, std::vector<PluginCommand> &)
 {
@@ -160,45 +39,58 @@ static command_result info(color_ostream &stream, const EmptyMessage *, Info *ou
 
 static command_result read_raw(color_ostream &stream, const ReadRawIn *in, ReadOut *out)
 {
-    std::string *data = out->mutable_data();
+    void *address = reinterpret_cast<void *>(in->address());
+    std::size_t length = in->length();
+    std::vector<char> data;
     try {
-        data->resize(in->length());
+        data.resize(length);
     }
     catch (std::exception &e) {
         stream << "Failed to allocate output buffer: " << e.what() << std::endl;
         return CR_FAILURE;
     }
-    if (!safe_copy(stream, reinterpret_cast<const char *>(in->address()), in->length(), &(*data)[0])) {
-        stream << "Failed to read raw data." << std::endl;
+    auto local = iovec{&data[0], length};
+    auto remote = iovec{address, length};
+    auto ret = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (ret == -1) {
+        int err = errno;
+        stream << "Failed to read memory: " << strerror(err) << std::endl;
         return CR_FAILURE;
     }
-    return CR_OK;
+    if (ret != length) {
+        stream << "Partial read_raw" << std::endl;
+    }
+    out->mutable_data()->assign(data.begin(), data.end());
+    return ret == length ? CR_OK : CR_FAILURE;
 }
 
 static command_result read_string(color_ostream &stream, const ReadStringIn *in, ReadOut *out)
 {
-    if (!safe_read_string(stream, reinterpret_cast<const void *>(in->address()), *out->mutable_data())) {
-        stream << "Failed to read string." << std::endl;
-        return CR_FAILURE;
-    }
-    return CR_OK;
+    stream << "Not implemented" << std::endl;
+    return CR_FAILURE;
 }
 
 static command_result write_raw(color_ostream &stream, const WriteIn *in)
 {
-    if (!safe_copy(stream, in->data().data(), in->data().size(), reinterpret_cast<char *>(in->address()))) {
-        stream << "Failed to write raw data." << std::endl;
-        return CR_FAILURE;
+    void *address = reinterpret_cast<void *>(in->address());
+    const std::string &data = in->data();
+    std::size_t length = data.size();
+    auto local = iovec{const_cast<char *>(&data[0]), length};
+    auto remote = iovec{address, length};
+    auto ret = process_vm_writev(getpid(), &local, 1, &remote, 1, 0);
+    if (ret == -1) {
+        int err = errno;
+        stream << "Failed to write memory: " << strerror(err) << std::endl;
     }
-    return CR_OK;
+    else if (ret != length) {
+        stream << "Partial write_raw" << std::endl;
+    }
+    return ret == length ? CR_OK : CR_FAILURE;
 }
 
 static command_result write_string(color_ostream &stream, const WriteIn *in)
 {
-    if (!safe_write_string(stream, reinterpret_cast<void *>(in->address()), in->data())) {
-        stream << "Failed to write string." << std::endl;
-        return CR_FAILURE;
-    }
+    reinterpret_cast<std::string *>(in->address())->assign(in->data());
     return CR_OK;
 }
 
